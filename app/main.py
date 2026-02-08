@@ -53,18 +53,8 @@ async def healthcheck() -> HealthResponse:
 
 @app.on_event("startup")
 async def on_startup() -> None:
-    if not settings.auto_migrate:
-        log.info("AUTO_MIGRATE is disabled; skipping migrations.")
-        return
-    if async_engine is None:
-        log.error("Database engine is not configured. Skipping migrations.")
-        return
-    try:
-        async with async_engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-    except Exception:
-        log.exception("Failed to run migrations on startup.")
-        raise
+    async with async_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
 @app.post("/tg/webhook/{secret}", response_model=TelegramOkResponse, tags=["telegram"])
 async def telegram_webhook(
@@ -102,6 +92,47 @@ async def telegram_webhook(
             f"Подключите Google Calendar: {oauth_url}",
         )
         return {"ok": True}
+
+    if command == "/client" and len(parts) >= 3:
+        trainer_id = int(parts[1])
+        name = " ".join(parts[2:])
+        client = Client(name=name, telegram_chat_id=str(chat_id), trainer_id=trainer_id)
+        session.add(client)
+        await session.commit()
+        await send_telegram_message(
+            settings.telegram_bot_token,
+            chat_id,
+            f"Клиент зарегистрирован у тренера {trainer_id}.",
+        )
+        return {"ok": True}
+
+    if command == "/sessions":
+        stmt = (
+            select(TrainingSession)
+            .join(Client, TrainingSession.client_id == Client.id)
+            .where(Client.telegram_chat_id == str(chat_id))
+            .order_by(TrainingSession.start_time)
+            .limit(5)
+        )
+        result = await session.execute(stmt)
+        sessions = result.scalars().all()
+        if not sessions:
+            await send_telegram_message(
+                settings.telegram_bot_token,
+                chat_id,
+                "Ближайших тренировок пока нет.",
+            )
+            return {"ok": True}
+        lines = [
+            "Ваши ближайшие тренировки:",
+            *[
+                f"• {item.start_time.astimezone(timezone.utc).strftime('%d.%m %H:%M UTC')} — {item.summary}"
+                for item in sessions
+            ],
+        ]
+        await send_telegram_message(settings.telegram_bot_token, chat_id, "\n".join(lines))
+        return {"ok": True}
+
 
     if command == "/client" and len(parts) >= 3:
         trainer_id = int(parts[1])
