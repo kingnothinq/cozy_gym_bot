@@ -6,6 +6,10 @@ class RootStatusResponse(BaseModel):
     service: str = Field(..., example="cozy-gym-bot")
 
 
+class HealthResponse(BaseModel):
+    status: str = Field(..., example="ok")
+
+
 class TelegramOkResponse(BaseModel):
     ok: bool = Field(..., example=True)
 

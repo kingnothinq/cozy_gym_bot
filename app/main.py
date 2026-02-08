@@ -20,6 +20,7 @@ from app.config import Settings
 from app.google_calendar import fetch_calendar_events, refresh_access_token
 from app.schemas import (
     CalendarSyncResponse,
+    HealthResponse,
     OAuthConnectedResponse,
     RootStatusResponse,
     TelegramOkResponse,
@@ -42,6 +43,12 @@ settings = Settings()
 async def root() -> RootStatusResponse:
     """Simple health check endpoint."""
     return {"status": "ok", "service": "cozy-gym-bot"}
+
+
+@app.get("/health", response_model=HealthResponse, tags=["system"])
+async def healthcheck() -> HealthResponse:
+    """Lightweight health endpoint for Cloud Run."""
+    return {"status": "ok"}
 
 
 @app.on_event("startup")
@@ -85,6 +92,47 @@ async def telegram_webhook(
             f"Подключите Google Calendar: {oauth_url}",
         )
         return {"ok": True}
+
+    if command == "/client" and len(parts) >= 3:
+        trainer_id = int(parts[1])
+        name = " ".join(parts[2:])
+        client = Client(name=name, telegram_chat_id=str(chat_id), trainer_id=trainer_id)
+        session.add(client)
+        await session.commit()
+        await send_telegram_message(
+            settings.telegram_bot_token,
+            chat_id,
+            f"Клиент зарегистрирован у тренера {trainer_id}.",
+        )
+        return {"ok": True}
+
+    if command == "/sessions":
+        stmt = (
+            select(TrainingSession)
+            .join(Client, TrainingSession.client_id == Client.id)
+            .where(Client.telegram_chat_id == str(chat_id))
+            .order_by(TrainingSession.start_time)
+            .limit(5)
+        )
+        result = await session.execute(stmt)
+        sessions = result.scalars().all()
+        if not sessions:
+            await send_telegram_message(
+                settings.telegram_bot_token,
+                chat_id,
+                "Ближайших тренировок пока нет.",
+            )
+            return {"ok": True}
+        lines = [
+            "Ваши ближайшие тренировки:",
+            *[
+                f"• {item.start_time.astimezone(timezone.utc).strftime('%d.%m %H:%M UTC')} — {item.summary}"
+                for item in sessions
+            ],
+        ]
+        await send_telegram_message(settings.telegram_bot_token, chat_id, "\n".join(lines))
+        return {"ok": True}
+
 
     if command == "/client" and len(parts) >= 3:
         trainer_id = int(parts[1])
