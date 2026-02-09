@@ -1,15 +1,12 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
-
-import logging
 
 from app.config import Settings
 
 
-log = logging.getLogger("cozygym")
 settings = Settings()
 
 
@@ -23,9 +20,6 @@ class Trainer(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str | None] = mapped_column(String(255))
     telegram_chat_id: Mapped[str] = mapped_column(String(64), unique=True)
-    sync_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
-    sync_interval_minutes: Mapped[int] = mapped_column(Integer, default=60)
-    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     clients: Mapped[list["Client"]] = relationship(back_populates="trainer")
@@ -79,21 +73,10 @@ class OAuthState(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
-async_engine = (
-    create_async_engine(settings.database_url, echo=False)
-    if settings.database_url
-    else None
-)
-AsyncSessionLocal = (
-    sessionmaker(async_engine, class_=AsyncSession, expire_on_commit=False)
-    if async_engine
-    else None
-)
+async_engine = create_async_engine(settings.database_url, echo=False)
+AsyncSessionLocal = sessionmaker(async_engine, class_=AsyncSession, expire_on_commit=False)
 
 
 async def get_async_session() -> AsyncSession:
-    if AsyncSessionLocal is None:
-        log.error("DATABASE_URL is not configured; set DATABASE_URL or Cloud SQL connector variables.")
-        raise RuntimeError("Database is not configured")
     async with AsyncSessionLocal() as session:
         yield session
