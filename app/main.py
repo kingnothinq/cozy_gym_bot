@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
@@ -15,6 +16,7 @@ from app.storage import (
     Client,
     async_engine,
     get_async_session,
+    AsyncSessionLocal,
 )
 from app.config import Settings
 from app.google_calendar import fetch_calendar_events, refresh_access_token
@@ -38,6 +40,111 @@ app = FastAPI(
 log = logging.getLogger("cozygym")
 logging.basicConfig(level=logging.INFO)
 settings = Settings()
+
+async def sync_calendar_for_trainer(
+    trainer_id: int,
+    session: AsyncSession,
+) -> int:
+    token = await session.scalar(select(OAuthToken).where(OAuthToken.trainer_id == trainer_id))
+    if not token:
+        raise HTTPException(status_code=400, detail="Trainer has no Google token")
+
+    access_token = token.access_token
+    if token.expires_at <= datetime.now(timezone.utc) + timedelta(minutes=1):
+        refreshed = await refresh_access_token(
+            settings,
+            code=None,
+            refresh_token=token.refresh_token,
+            is_initial=False,
+        )
+        token.access_token = refreshed["access_token"]
+        token.expires_at = datetime.now(timezone.utc) + timedelta(seconds=refreshed["expires_in"])
+        await session.commit()
+        access_token = token.access_token
+
+    events = await fetch_calendar_events(access_token)
+    clients = (await session.execute(select(Client).where(Client.trainer_id == trainer_id))).scalars().all()
+    client_map = {client.name.lower(): client for client in clients}
+    now = datetime.now(timezone.utc)
+    notify_before = now + timedelta(hours=24)
+
+    for event in events:
+        summary = event.get("summary", "Тренировка")
+        start = event.get("start", {}).get("dateTime")
+        end = event.get("end", {}).get("dateTime")
+        if not start or not end:
+            continue
+        start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+        end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
+
+        matched_client = None
+        for name, client in client_map.items():
+            if name and name in summary.lower():
+                matched_client = client
+                break
+
+        session_obj = await session.scalar(
+            select(TrainingSession).where(TrainingSession.calendar_event_id == event["id"])
+        )
+        if not session_obj:
+            session_obj = TrainingSession(
+                trainer_id=trainer_id,
+                client_id=matched_client.id if matched_client else None,
+                calendar_event_id=event["id"],
+                summary=summary,
+                start_time=start_dt,
+                end_time=end_dt,
+            )
+            session.add(session_obj)
+        else:
+            session_obj.summary = summary
+            session_obj.start_time = start_dt
+            session_obj.end_time = end_dt
+            if matched_client:
+                session_obj.client_id = matched_client.id
+
+        if (
+            matched_client
+            and session_obj.notified_at is None
+            and now <= start_dt <= notify_before
+        ):
+            await send_telegram_message(
+                settings.telegram_bot_token,
+                int(matched_client.telegram_chat_id),
+                f"Напоминание: тренировка {start_dt.strftime('%d.%m %H:%M')} — {summary}",
+            )
+            session_obj.notified_at = now
+
+    await session.commit()
+    return len(events)
+
+
+async def run_sync_scheduler() -> None:
+    if AsyncSessionLocal is None:
+        log.error("DATABASE_URL is not configured; scheduler is disabled.")
+        return
+    while True:
+        try:
+            async with AsyncSessionLocal() as session:
+                now = datetime.now(timezone.utc)
+                trainers = (
+                    await session.execute(
+                        select(Trainer).where(Trainer.sync_enabled.is_(True))
+                    )
+                ).scalars().all()
+                for trainer in trainers:
+                    due_at = trainer.last_synced_at or datetime.fromtimestamp(0, tz=timezone.utc)
+                    if now - due_at < timedelta(minutes=trainer.sync_interval_minutes):
+                        continue
+                    try:
+                        await sync_calendar_for_trainer(trainer.id, session)
+                        trainer.last_synced_at = now
+                        await session.commit()
+                    except Exception:
+                        log.exception("Failed to auto-sync trainer_id=%s", trainer.id)
+        except Exception:
+            log.exception("Sync scheduler loop failed")
+        await asyncio.sleep(60)
 
 @app.get("/", response_model=RootStatusResponse, tags=["system"])
 async def root() -> RootStatusResponse:
@@ -65,6 +172,7 @@ async def on_startup() -> None:
     except Exception:
         log.exception("Failed to run migrations on startup.")
         raise
+    app.state.sync_task = asyncio.create_task(run_sync_scheduler())
 
 @app.post("/tg/webhook/{secret}", response_model=TelegramOkResponse, tags=["telegram"])
 async def telegram_webhook(
@@ -143,13 +251,66 @@ async def telegram_webhook(
         await send_telegram_message(settings.telegram_bot_token, chat_id, "\n".join(lines))
         return {"ok": True}
 
+    if command == "/sync":
+        result = await session.execute(select(Trainer).where(Trainer.telegram_chat_id == str(chat_id)))
+        trainer = result.scalar_one_or_none()
+        if not trainer:
+            await send_telegram_message(
+                settings.telegram_bot_token,
+                chat_id,
+                "Сначала зарегистрируйте тренера командой /trainer.",
+            )
+            return {"ok": True}
+
+        if len(parts) == 2:
+            if parts[1].lower() in {"off", "disable", "stop"}:
+                trainer.sync_enabled = False
+                await session.commit()
+                await send_telegram_message(
+                    settings.telegram_bot_token,
+                    chat_id,
+                    "Автосинхронизация отключена.",
+                )
+                return {"ok": True}
+            try:
+                minutes = int(parts[1])
+            except ValueError:
+                await send_telegram_message(
+                    settings.telegram_bot_token,
+                    chat_id,
+                    "Некорректный интервал. Пример: /sync 60",
+                )
+                return {"ok": True}
+            trainer.sync_interval_minutes = max(minutes, 1)
+            trainer.sync_enabled = True
+            await session.commit()
+            await send_telegram_message(
+                settings.telegram_bot_token,
+                chat_id,
+                f"Автосинхронизация включена: каждые {trainer.sync_interval_minutes} мин.",
+            )
+            return {"ok": True}
+
+        events = await sync_calendar_for_trainer(trainer.id, session)
+        trainer.last_synced_at = datetime.now(timezone.utc)
+        await session.commit()
+        await send_telegram_message(
+            settings.telegram_bot_token,
+            chat_id,
+            f"Синхронизация выполнена. Событий: {events}.",
+        )
+        return {"ok": True}
+
     await send_telegram_message(
         settings.telegram_bot_token,
         chat_id,
         "Команды:\n"
         "/trainer — зарегистрировать тренера\n"
         "/client <trainer_id> <имя клиента> — зарегистрировать клиента\n"
-        "/sessions — показать ближайшие тренировки",
+        "/sessions — показать ближайшие тренировки\n"
+        "/sync — запустить синхронизацию вручную\n"
+        "/sync <минуты> — включить автосинхронизацию\n"
+        "/sync off — выключить автосинхронизацию",
     )
     return {"ok": True}
 
@@ -212,75 +373,5 @@ async def sync_calendar(
     session: AsyncSession = Depends(get_async_session),
 ) -> CalendarSyncResponse:
     """Synchronize Google Calendar events for a trainer and notify clients."""
-    token = await session.scalar(select(OAuthToken).where(OAuthToken.trainer_id == trainer_id))
-    if not token:
-        raise HTTPException(status_code=400, detail="Trainer has no Google token")
-
-    access_token = token.access_token
-    if token.expires_at <= datetime.now(timezone.utc) + timedelta(minutes=1):
-        refreshed = await refresh_access_token(
-            settings,
-            code=None,
-            refresh_token=token.refresh_token,
-            is_initial=False,
-        )
-        token.access_token = refreshed["access_token"]
-        token.expires_at = datetime.now(timezone.utc) + timedelta(seconds=refreshed["expires_in"])
-        await session.commit()
-        access_token = token.access_token
-
-    events = await fetch_calendar_events(access_token)
-    clients = (await session.execute(select(Client).where(Client.trainer_id == trainer_id))).scalars().all()
-    client_map = {client.name.lower(): client for client in clients}
-    now = datetime.now(timezone.utc)
-    notify_before = now + timedelta(hours=24)
-
-    for event in events:
-        summary = event.get("summary", "Тренировка")
-        start = event.get("start", {}).get("dateTime")
-        end = event.get("end", {}).get("dateTime")
-        if not start or not end:
-            continue
-        start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
-        end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
-
-        matched_client = None
-        for name, client in client_map.items():
-            if name and name in summary.lower():
-                matched_client = client
-                break
-
-        session_obj = await session.scalar(
-            select(TrainingSession).where(TrainingSession.calendar_event_id == event["id"])
-        )
-        if not session_obj:
-            session_obj = TrainingSession(
-                trainer_id=trainer_id,
-                client_id=matched_client.id if matched_client else None,
-                calendar_event_id=event["id"],
-                summary=summary,
-                start_time=start_dt,
-                end_time=end_dt,
-            )
-            session.add(session_obj)
-        else:
-            session_obj.summary = summary
-            session_obj.start_time = start_dt
-            session_obj.end_time = end_dt
-            if matched_client:
-                session_obj.client_id = matched_client.id
-
-        if (
-            matched_client
-            and session_obj.notified_at is None
-            and now <= start_dt <= notify_before
-        ):
-            await send_telegram_message(
-                settings.telegram_bot_token,
-                int(matched_client.telegram_chat_id),
-                f"Напоминание: тренировка {start_dt.strftime('%d.%m %H:%M')} — {summary}",
-            )
-            session_obj.notified_at = now
-
-    await session.commit()
-    return {"status": "synced", "events": len(events)}
+    events = await sync_calendar_for_trainer(trainer_id, session)
+    return {"status": "synced", "events": events}

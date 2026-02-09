@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
@@ -23,6 +23,9 @@ class Trainer(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str | None] = mapped_column(String(255))
     telegram_chat_id: Mapped[str] = mapped_column(String(64), unique=True)
+    sync_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    sync_interval_minutes: Mapped[int] = mapped_column(Integer, default=60)
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     clients: Mapped[list["Client"]] = relationship(back_populates="trainer")
